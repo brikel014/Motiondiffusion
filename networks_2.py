@@ -3,6 +3,15 @@ import torch.nn as nn
 import math
 from typing import Dict
 
+class DiscreteCondProj(nn.Module):
+    def __init__(self, in_dim=3, hid=128, out_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hid), nn.SiLU(),
+            nn.Linear(hid, out_dim)
+        )
+    def forward(self, y_onehot):  # [B,A,3] oder [B,3]
+        return self.net(y_onehot)
 class AgentSelfAttention(nn.Module):
     """Temporal self-attention within each agent over its own time steps with multi-head attention."""
     def __init__(self, input_dim=256, d_k=256, dropout=0.1):
@@ -205,7 +214,7 @@ class AgentRoadGraphAttention(nn.Module):
         return x + self.dropout(attn_output)
     
 class FeatureMLP(nn.Module):
-    def __init__(self, input_dim=5*256, output_dim=256, hidden_dim=1024):
+    def __init__(self, input_dim=1408, output_dim=256, hidden_dim=1024):
         super().__init__()
         self.layer1 = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.GELU())
         self.layer2 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU())
