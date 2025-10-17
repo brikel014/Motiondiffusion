@@ -1,280 +1,320 @@
-# real_train.py
-import time
-import math
 import os
+import time
+import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+import math
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch import optim, amp
+from torch.utils.tensorboard import SummaryWriter
+from torch import amp
 
 from map_pre_old import MapDataset
 from networks_2 import Denoiser
+from infer_2 import calculate_validation_loss_and_plot  # unchanged import
 from utils import embed_features
 
-# =========================
-# FIXED SETTINGS (edit here)
-# =========================
-XML_DIR = "/Users/brikelkeputa/Downloads/singapore_split/cleaneddata/test"
-OBS_LEN = 10
-PRED_LEN = 20
-NUM_TIMESTEPS = OBS_LEN + PRED_LEN
-MAX_RADIUS = 100
-NUM_POLYLINES = 500
-NUM_POINTS = 10
-MAX_AGENTS = 32
+# ------------------- Helper: Validation-Plot speichern ------------------- #
+# Function to save validation plots, with a limit on the number of saves per run.
+def save_val_fig(fig, epoch, writer=None, max_saves=5, base_dir="runs/val_plots"):
+    """Speichert höchstens `max_saves` Validierungsplots pro Training in einem Run-Ordner."""
+    if fig is None:
+        warnings.warn(f"[VAL] Keine Figure erzeugt (epoch={epoch}).")
+        return
+    # state am Funktionsobjekt (einmalig pro Run)
+    if not hasattr(save_val_fig, "_dir"):
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        save_val_fig._dir = os.path.join(base_dir, f"train_{ts}")
+        os.makedirs(save_val_fig._dir, exist_ok=True)
+        save_val_fig._count = 0
+        print(f"[VAL] Plots werden gespeichert unter: {save_val_fig._dir}")
+    if save_val_fig._count >= max_saves:
+        return
+    out_path = os.path.join(save_val_fig._dir, f"val_epoch_{int(epoch):03d}.png")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UserWarning)
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"[VAL] Plot saved -> {out_path}")
+    save_val_fig._count += 1
+    if writer is not None:
+        writer.add_figure(f"Inference/Validation_Epoch_{epoch}", fig, epoch)
 
-BATCH_SIZE = 32
-EPOCHS = 20
-LR = 1e-4
-SIGMA_DATA = 0.5
+# ------------------- Device & DataLoader Settings ------------------- #
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+scaler = amp.GradScaler('cuda') if device.type == 'cuda' else None
+def _safe_num_workers():
+    return 1 if torch.cuda.is_available() else 0
 
-# Conditioning / CFG
-TURN_THRESH_DEG = 10.0
-P_UNCOND = 0.2
-COND_DIM = 128
-LAMBDA_DIR = 0.1
 
-# =========================
-# Conditioning helpers
-# =========================
-def angle_wrap(a: torch.Tensor) -> torch.Tensor:
+# ------------------- Conditioning helpers (minimal, additive) ------------------- #
+EMBED_DX = 5 * 256  # utils.embed_features default => 5 * embedding_dim(=256) = 1280 
+P_UNCOND  = 0.20    # classifier-free guidance drop prob
+TURN_THRESH_DEG = 10.0  # how much θ change to call left/right
+
+class CondProj(torch.nn.Module):
+    """One-hot(3) → Dx (1280) via small MLP. Output size = EMBED_DX to allow additive conditioning."""
+    def __init__(self, out_dim=EMBED_DX):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(3, 128), torch.nn.SiLU(),
+            torch.nn.Linear(128, out_dim)
+        )
+    def forward(self, y_onehot):  # [B,A,3] or [B,3]
+        if y_onehot.dim() == 2:
+            y_onehot = y_onehot.unsqueeze(1)  # [B,1,3]
+        return self.net(y_onehot)  # [B,A,Dx]
+
+def _angle_wrap(a: torch.Tensor) -> torch.Tensor:
     return (a + math.pi) % (2 * math.pi) - math.pi
 
-def _unwrap_diff(theta: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    d = torch.diff(theta, dim=dim)
-    return angle_wrap(d)
-
 @torch.no_grad()
-def direction_onehot_from_theta(theta_seq: torch.Tensor, turn_thresh_deg: float = 10.0) -> torch.Tensor:
+# Convert future angles to one-hot direction commands.
+# The Function take B,A,T tensor and returns B,A,3 one-hot tensor
+def dir_onehot_from_theta(theta_future: torch.Tensor, thresh_deg: float = TURN_THRESH_DEG) -> torch.Tensor:
     """
-    theta_seq: [B,A,T] (rad) Zukunftsfenster
-    return onehot [B,A,3] = [right, straight, left]
+    theta_future: [B,A,Tp], in radians. Returns one-hot [B,A,3] = [right, straight, left].
+    Uses summed Δtheta over the future horizon with wrap handling.
     """
-    dtheta = _unwrap_diff(theta_seq, dim=-1)       # [B,A,T-1]
-    total = dtheta.sum(dim=-1)                     # [B,A]
-    th = math.radians(turn_thresh_deg)
+    dtheta = _angle_wrap(theta_future[..., 1:] - theta_future[..., :-1])  # [B,A,Tp-1]
+    total = dtheta.sum(dim=-1)  # [B,A]
+    th = math.radians(thresh_deg)
     left = (total > th)
     right = (total < -th)
     straight = ~(left | right)
-    y = torch.zeros((*total.shape, 3), device=theta_seq.device, dtype=torch.float32)
+    y = torch.zeros((*total.shape, 3), device=theta_future.device, dtype=torch.float32)
     y[..., 0] = right.float()
     y[..., 1] = straight.float()
     y[..., 2] = left.float()
     return y
-
-class DiscreteCondProj(nn.Module):
-    """ onehot(3) -> cond_embed (dc) """
-    def __init__(self, in_dim: int = 3, hid: int = 128, out_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hid), nn.SiLU(),
-            nn.Linear(hid, out_dim)
-        )
-    def forward(self, y_onehot: torch.Tensor) -> torch.Tensor:
-        # y_onehot: [B,A,3] oder [B,3]
-        if y_onehot.dim() == 2:
-            y_onehot = y_onehot.unsqueeze(1)  # [B,1,3]
-        return self.net(y_onehot)             # [B,A,dc]
-
-def drop_condition_cfg(y_onehot: torch.Tensor, p_uncond: float) -> torch.Tensor:
-    drop_mask = (torch.rand(y_onehot.shape[:2], device=y_onehot.device) < p_uncond)
-    y_drop = y_onehot.clone()
-    y_drop[drop_mask] = 0.0
-    return y_drop
-
-def build_cond_time(cond_embed: torch.Tensor, pred_len: int) -> torch.Tensor:
-    return cond_embed.unsqueeze(2).expand(-1, -1, pred_len, -1)
-
-def concat_condition_to_embed(x_embed: torch.Tensor, cond_time: torch.Tensor, obs_len: int) -> torch.Tensor:
+# Convert one-hot direction command back to string labels in German.
+def _drop_condition(y_onehot: torch.Tensor, p_uncond: float = P_UNCOND) -> torch.Tensor:
+    """Classifier-free guidance: randomly drop the condition to zero."""
+    drop = (torch.rand(y_onehot.shape[:2], device=y_onehot.device) < p_uncond)  # [B,A]
+    y = y_onehot.clone()
+    y[drop] = 0.0
+    return y
+# Add condition (same width as x_embed) only on the future timesteps.
+def _add_condition_to_embed(x_embed: torch.Tensor, cond_time: torch.Tensor, obs_len: int) -> torch.Tensor:
     """
-    Make feature dim consistent across all timesteps:
-    - past gets Dc zeros
-    - future gets the actual cond_time
+    Add condition (same width as x_embed) only on the future timesteps.
+      x_embed: [B,A,T,Dx], cond_time: [B,A,Tp,Dx]
     """
-    B, A, T, Dx = x_embed.shape
-    Tp = cond_time.size(2)                   # [B,A,Tp,Dc]
-    Dc = cond_time.size(-1)
-    assert obs_len + Tp == T, "obs_len + pred_len must equal T"
-
-    # pad past with zeros in cond channel
-    zeros_past = torch.zeros(B, A, obs_len, Dc, device=x_embed.device, dtype=x_embed.dtype)
-    past_cat   = torch.cat([x_embed[:, :, :obs_len, :], zeros_past], dim=-1)          # [B,A,To,Dx+Dc]
-    future_cat = torch.cat([x_embed[:, :, obs_len:, :], cond_time], dim=-1)           # [B,A,Tp,Dx+Dc]
-
-    out = torch.cat([past_cat, future_cat], dim=2)                                    # [B,A,T,Dx+Dc]
+    out = x_embed
+    out[:, :, obs_len:, :] = out[:, :, obs_len:, :] + cond_time
     return out
 
-class DirectionHead(nn.Module):
-    """ Aux-Head: Zukunfts-(x,y) -> logits [B,A,3] """
-    def __init__(self, hidden: int = 128, bidirectional: bool = True):
-        super().__init__()
-        self.gru = nn.GRU(input_size=2, hidden_size=hidden, num_layers=1,
-                          batch_first=True, bidirectional=bidirectional)
-        out_dim = hidden * (2 if bidirectional else 1)
-        self.proj = nn.Sequential(nn.Linear(out_dim, out_dim), nn.SiLU(), nn.Linear(out_dim, 3))
-    def forward(self, xy_future: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        B,A,T,_ = xy_future.shape
-        x = xy_future.view(B*A, T, 2)
-        h, _ = self.gru(x)
-        if mask is not None:
-            m = mask.view(B*A, T, 1).float()
-            h = (h * m).sum(dim=1) / (m.sum(dim=1).clamp_min(1.0))
-        else:
-            h = h.mean(dim=1)
-        logits = self.proj(h).view(B, A, 3)
-        return logits
 
-# =========================
-# EDM helpers (match infer)
-# =========================
-def edm_coeffs(sigma_t: torch.Tensor, sigma_data: float, device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    s2 = torch.as_tensor(sigma_data * sigma_data, device=device, dtype=torch.float32)
-    ti2 = sigma_t * sigma_t
-    ti2_s2 = ti2 + s2
-    c_in   = 1.0 / torch.sqrt(ti2_s2)
-    c_skip = s2 / ti2_s2
-    c_out  = sigma_t * torch.sqrt(s2) / torch.sqrt(ti2_s2)  # == ti * sigma_data / sqrt(ti^2 + s2)
-    return c_in, c_skip, c_out
+# ------------------- Training ------------------- #
+def train(model, writer):
+    start_time = time.time()
+    print(f"Using device: {device}")
+    
+    # Improves performance for consistent input sizes
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
 
-def sample_sigmas_edm(batch_size: int, sigma_min: float, sigma_max: float, device) -> torch.Tensor:
-    rho = 7.0
-    u = torch.rand(batch_size, device=device)
-    return (sigma_max**(1/rho) + u * (sigma_min**(1/rho) - sigma_max**(1/rho))) ** rho
-
-def _normalize_like_train(x, scene_means, scene_stds, eps=1e-6):
-    return (x - scene_means[:, None, None, :]) / (scene_stds[:, None, None, :] + eps)
-
-# =========================
-# MAIN
-# =========================
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Dataset & Loader (DEIN Stil)
     dataset = MapDataset(
-        xml_dir=XML_DIR,
-        obs_len=OBS_LEN, pred_len=PRED_LEN, max_radius=MAX_RADIUS,
-        num_timesteps=NUM_TIMESTEPS, num_polylines=NUM_POLYLINES, num_points=NUM_POINTS,
-        save_plots=False, max_agents=MAX_AGENTS
+        xml_dir="/Users/brikelkeputa/Downloads/singapore_split/cleaneddata/test",
+        obs_len=10, pred_len=20, max_radius=100,
+        num_timesteps=30, num_polylines=500, num_points=10,
+        save_plots=False, max_agents=32
     )
     dataloader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=4,
-        pin_memory=torch.cuda.is_available(),
+        dataset, batch_size=32, shuffle=True,
+        num_workers=_safe_num_workers(), pin_memory=(device.type=='cuda'),
         persistent_workers=False
     )
 
-    # Model + conditioning modules
-    model = Denoiser().to(device)
-    cond_proj = DiscreteCondProj(out_dim=COND_DIM).to(device)
-    dir_head  = DirectionHead().to(device)
-
-    opt = optim.AdamW(list(model.parameters()) + list(cond_proj.parameters()) + list(dir_head.parameters()),
-                      lr=LR, weight_decay=1e-4)
-    scaler = amp.GradScaler(enabled=torch.cuda.is_available())
-
-    sigma_min, sigma_max = 0.002, 20.0
+    model = model.to(device)
     model.train()
 
-    for epoch in range(1, EPOCHS+1):
-        t0 = time.time()
-        run_recon = 0.0
-        run_ce    = 0.0
-        n_steps   = 0
+    # NEW: condition projector (tiny MLP). We keep Denoiser unchanged.
+    cond_proj = CondProj(out_dim=EMBED_DX).to(device)
+
+    # Optimizer now includes cond_proj params (rest unchanged)
+    optimizer = optim.Adam(model.parameters(), lr=0.0)
+    optimizer.add_param_group({"params": cond_proj.parameters(), "lr": 0.0})  # same LR schedule
+
+    end_time=time.time()
+    print(f"Time taken to set up dataset and dataloader: {end_time - start_time} seconds")
+
+    steps_per_epoch = len(dataloader)
+    ramp_up_steps = max(1, int(0.1 * steps_per_epoch))
+    target_lr = 3e-4
+    sigma_data = 0.5
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total number of parameters: {total_params:,} (+ {sum(p.numel() for p in cond_proj.parameters()):,} cond)")
+
+    num_epochs = 1000
+    global_step = 0
+    parts = 5
+    milestones = sorted({math.ceil(num_epochs * i / parts) for i in range(1, parts + 1)})
+
+    train_losses, val_losses = [], []
+
+    for epoch in range(num_epochs):
+        
+        print(f"--- Epoch {epoch+1}/{num_epochs} ---")  
+        print(device) 
+        epoch_loss = 0.0
+        num_batches = 0
 
         for batch in dataloader:
             (ego_ids, feature_tensor, feature_mask, roadgraph_tensor, roadgraph_mask,
              observed, observed_masks, ground_truth, ground_truth_masks,
              scene_means, scene_stds) = batch
 
-            feature_tensor = feature_tensor.to(device, non_blocking=True)   # [B,A,T,F] (x,y,theta,...)
+            feature_tensor = feature_tensor.to(device, non_blocking=True)   # [B,A,T,3]  (x,y,theta)
             feature_mask   = feature_mask.to(device, non_blocking=True)     # [B,A,T]
             roadgraph_tensor = roadgraph_tensor.to(device, non_blocking=True)
             roadgraph_mask   = roadgraph_mask.to(device, non_blocking=True)
-            ground_truth     = ground_truth.to(device, non_blocking=True)
-            ground_truth_masks = ground_truth_masks.to(device, non_blocking=True)
             scene_means = scene_means.to(device, non_blocking=True)
             scene_stds  = scene_stds.to(device, non_blocking=True)
 
-            B,A,T,FeatDim = feature_tensor.shape
-            To, Tp  = OBS_LEN, PRED_LEN
+            B, A, T, F = feature_tensor.shape
+            assert F == 3, "Expected x,y,theta as 3 features"
+            To = 10  # obs_len fixed in dataset above
+            Tp = T - To
 
-            # Splits
-            past  = feature_tensor[:, :, :To, :]          # [B,A,To,F]
-            fut   = feature_tensor[:, :, To:, :]          # [B,A,Tp,F]
-            fut_m = feature_mask[:, :, To:]               # [B,A,Tp]
+            global_step += 1
+            optimizer.zero_grad()
+            
+            with amp.autocast('cuda', enabled=(device.type == 'cuda')):
 
-            # Conditioning labels aus theta (Zukunft)
-            theta_future = fut[..., 2]                    # [B,A,Tp]
-            y_onehot = direction_onehot_from_theta(theta_future, turn_thresh_deg=TURN_THRESH_DEG)  # [B,A,3]
-            y_drop   = drop_condition_cfg(y_onehot, p_uncond=P_UNCOND)
+                # Noise-Training (EDM-ähnlich)
+                sigma, noised_tensor = sample_noise(feature_tensor)
 
-            # Cond-Embedding
-            cond_embed = cond_proj(y_drop)                # [B,A,dc]
-            cond_time  = build_cond_time(cond_embed, Tp)  # [B,A,Tp,dc]
+                c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
+                c_out  = sigma * sigma_data / torch.sqrt(sigma_data**2 + sigma**2)
+                c_in   = 1.0 / torch.sqrt(sigma**2 + sigma_data**2)
+                c_noise = torch.log(sigma) * 0.25  # [B]
+                # Precondition the latent (future) part only (your original logic)
+                result = noised_tensor.clone()
+                c_in_broadcast = c_in[:, None, None, None]
+                result[:, :, To:, :] = c_in_broadcast * noised_tensor[:, :, To:, :]
 
-            # EDM sigma pro Item
-            sigmas = sample_sigmas_edm(B, sigma_min, sigma_max, device)     # [B]
-            sigma_b = sigmas.view(B,1,1,1)                                  # [B,1,1,1]
+                # ---- NEW: build direction condition from future theta ----
+                theta_future = feature_tensor[:, :, To:, 2]  # [B,A,Tp]
+                y_onehot = dir_onehot_from_theta(theta_future, TURN_THRESH_DEG)  # [B,A,3]
+                y_cf = _drop_condition(y_onehot, P_UNCOND)                        # CFG drop
 
-            # Noisy future
-            noise = torch.randn_like(fut)
-            x_noisy_future = fut + sigma_b * noise
+                # Embed features (unchanged API)
+                embedded = embed_features(result, c_noise)  # [B,A,T,EMBED_DX]
 
-            # Preconditioning
-            c_in, c_skip, c_out = edm_coeffs(sigmas, SIGMA_DATA, device)
+                # Project condition to Dx and add only on the future window (no shape change)
+                cond_embed = cond_proj(y_cf)                             # [B,A,EMBED_DX]
+                cond_time  = cond_embed.unsqueeze(2).expand(-1,-1,Tp,-1) # [B,A,Tp,EMBED_DX]
+                embedded   = _add_condition_to_embed(embedded, cond_time, To)
 
-            full_seq = torch.cat([past, x_noisy_future], dim=2)             # [B,A,T,F]
-            full_scaled = full_seq.clone()
-            full_scaled[:, :, To:, :] *= c_in.view(B,1,1,1)
+                # Forward pass (unchanged)
+                model_out = model(embedded, roadgraph_tensor, feature_mask, roadgraph_mask)[:, :, To:, :]
 
-            # Normalisieren (selbe Stelle wie in infer)
-            full_scaled = _normalize_like_train(full_scaled, scene_means, scene_stds)
+                gt_pred   = feature_tensor[:, :, To:, :]
+                mask_pred = feature_mask[:, :, To:]
+                valid_mask = mask_pred.unsqueeze(-1).expand_as(gt_pred)
 
-            # Embed
-            c_noise = (0.25 * torch.log(sigmas)).to(device)  # [B]
-            x_embed = embed_features(full_scaled, c_noise, eval=False)       # [B,A,T,Dx]
+                recon = model_out * c_out[:, None, None, None] + noised_tensor[:, :, To:, :] * c_skip[:, None, None, None]
 
-            # Condition in Zukunft anhängen
-            x_embed = concat_condition_to_embed(x_embed, cond_time, To)     # [B,A,T,Dx+dc]
+                squared_diff = (recon - gt_pred) ** 2
+                masked_squared_diff = squared_diff * valid_mask
 
-            with amp.autocast(device_type='cuda', enabled=torch.cuda.is_available()):
-                out = model(x_embed, roadgraph_tensor, feature_mask, roadgraph_mask)  # [B,A,T,F]
-                out_future = out[:, :, To:, :]                                       # [B,A,Tp,F]
+                loss_per_batch = masked_squared_diff.sum(dim=[1, 2, 3]) / valid_mask.sum(dim=[1, 2, 3]).clamp(min=1e-6)
 
-                # x0_hat rekonstruieren (wie in infer)
-                x0_hat = c_skip.view(B,1,1,1) * x_noisy_future + c_out.view(B,1,1,1) * out_future
+                weight = (sigma**2 + sigma_data**2) / (sigma * sigma_data)**2
+                weighted_loss = (loss_per_batch * weight).mean()
+            
+            if scaler:
+                scaler.scale(weighted_loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                weighted_loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+                
+            writer.add_scalar("GradNorm", float(grad_norm), global_step)
 
-                # Recon-Loss (nur gültige Zukunft)
-                valid = fut_m.unsqueeze(-1)
-                recon_loss = (((x0_hat - fut) ** 2) * valid).sum() / (valid.sum() + 1e-6)
+            lr = (global_step / ramp_up_steps) * target_lr if global_step < ramp_up_steps else target_lr
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
+            writer.add_scalar("LR", lr, global_step)
+            
+            writer.add_scalar("Loss/Iteration", weighted_loss.item(), global_step)
+            writer.add_scalar("Sigma/Example0", sigma[0].item(), global_step)
 
-                # Aux Direction CE-Loss (auf XY der Vorhersage)
-                dir_logits = dir_head(x0_hat[..., :2].detach(), mask=fut_m)  # [B,A,3]
-                ce_loss = -(y_onehot * F.log_softmax(dir_logits, dim=-1)).sum(dim=-1).mean()
+            train_losses.append(weighted_loss.item())
+            epoch_loss += weighted_loss.item()
+            num_batches += 1
+            global_step += 1
 
-                total_loss = recon_loss + LAMBDA_DIR * ce_loss
+        avg_epoch_loss = epoch_loss / max(1, num_batches)
+        writer.add_scalar("Loss/Epoch", avg_epoch_loss, epoch)
+        print(f"Epoch {epoch} completed. Average Loss: {avg_epoch_loss:.4f}")
 
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(total_loss).backward()
-            scaler.step(opt)
-            scaler.update()
+        # ------------------- Validation (alle 20 Epochen) --------------
+        if epoch % 20 == 0:
+            
+            ckpt = {
+                "model": model.state_dict(),
+                "cond_proj": cond_proj.state_dict(),
+                "epoch": epoch,
+            }
+            os.makedirs("ckpts", exist_ok=True)
+            torch.save(ckpt, f"ckpts/model_epoch_{epoch}_REAL.pt")
 
-            run_recon += recon_loss.item()
-            run_ce    += ce_loss.item()
-            n_steps   += 1
+            avg_val_loss, val_fig = calculate_validation_loss_and_plot(
+                model=model,
+                val_xml_dir="/Users/brikelkeputa/Downloads/singapore_split/cleaneddata/test",
+                val_batch_size=32,
+                obs_len=10, pred_len=20,
+                max_radius=100,
+                num_polylines=500, num_points=10,
+                max_agents=32,
+                sigma_data=0.5,
+                device=device,
+                direction_command=True,             # see next point
+                cond_scale=2.0,
+                turn_thresh_deg=TURN_THRESH_DEG,    # <— 10.0 to match training
+                cond_proj_state_dict=cond_proj.state_dict(),  # <— use the trained projector
+            )
 
-        dt = time.time() - t0
-        print(f"[TRAIN] epoch {epoch:03d} | recon={run_recon/max(1,n_steps):.5f} | dirCE={run_ce/max(1,n_steps):.5f} | dt={dt:.1f}s")
+            if not np.isnan(avg_val_loss):
+                val_losses.append(avg_val_loss)
+                writer.add_scalar("Loss/Validation", avg_val_loss, epoch)
+                save_val_fig(val_fig, epoch, writer=writer)
 
-    # Optional: speichern
-    os.makedirs("./checkpoints", exist_ok=True)
-    torch.save({
-        "model": model.state_dict(),
-        "cond_proj": cond_proj.state_dict(),
-        "dir_head": dir_head.state_dict(),
-        "epoch": EPOCHS
-    }, "./checkpoints/final.pt")
-    print("[DONE] saved ./checkpoints/final.pt")
+    print("Training finished.")
+
+
+# ------------------- Noise sampler (your original helper) ------------------- #
+def sample_noise(feature_tensor):
+    """
+    Return per-batch sigma and a noised tensor, compatible with your training loop.
+    """
+    B = feature_tensor.size(0)
+    # EDM-like sampling — keep whatever you had; placeholder:
+    sigma_min, sigma_max, rho = 0.002, 20.0, 7.0
+    u = torch.rand(B, device=feature_tensor.device)
+    sigma = (sigma_max**(1/rho) + u * (sigma_min**(1/rho) - sigma_max**(1/rho))) ** rho  # [B]
+    noise = torch.randn_like(feature_tensor)
+    noised = feature_tensor.clone()
+    noised[:, :, 10:, :] = feature_tensor[:, :, 10:, :] + sigma[:, None, None, None] * noise[:, :, 10:, :]
+    return sigma, noised
+
+
+# ------------------- Main ------------------- #
+if __name__ == "__main__":
+    writer = None
+    try:
+        writer = SummaryWriter(log_dir="./runs_5/REAL")
+        model = Denoiser()
+        train(model, writer)
+    finally:
+        if writer is not None:
+            writer.close()
+        print("Training completed and TensorBoard writer closed.")

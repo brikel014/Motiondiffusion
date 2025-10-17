@@ -214,21 +214,20 @@ class AgentRoadGraphAttention(nn.Module):
         return x + self.dropout(attn_output)
     
 class FeatureMLP(nn.Module):
-    def __init__(self, input_dim=1408, output_dim=256, hidden_dim=1024):
+    def __init__(self, input_dim=1280, output_dim=256, hidden_dim=1024):
         super().__init__()
         self.layer1 = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.GELU())
         self.layer2 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU())
         self.layer3 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU())
         self.out = nn.Linear(hidden_dim, output_dim)
-        self.shortcut = nn.Linear(input_dim, output_dim)  # Residual path
+        self.shortcut = nn.Linear(input_dim, output_dim)  # residual path stays aligned to input_dim
     
     def forward(self, x):
         h = self.layer1(x)
         h = self.layer2(h)
         h = self.layer3(h)
         out = self.out(h)
-        return out + self.shortcut(x)  # Add raw input back
-
+        return out + self.shortcut(x)
 class RoadGraphMLP(nn.Module):
     def __init__(self, input_dim=20, output_dim=256, hidden_dim=256):
         super().__init__()

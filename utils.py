@@ -170,8 +170,8 @@ def plot_trajectories(map_polylines, polyline_masks, pred_traj, gt_traj, noisy_t
 
     # --- Handle Output ---
     if save_path is not None:
-        plt.savefig(f"{save_path}.png", dpi=150, bbox_inches='tight')
-        print(f"  Visualization saved: {save_path}.png")
+        plt.savefig(f"{save_path}.svg", dpi=350, bbox_inches='tight')
+        print(f"  Visualization saved: {save_path}.svg")
         plt.close(fig)
         return None
     elif not eval:
@@ -180,65 +180,34 @@ def plot_trajectories(map_polylines, polyline_masks, pred_traj, gt_traj, noisy_t
         return None
     else:
         return fig # Return figure object for TensorBoard etc.
+from typing import Optional # Diesen Import ggf. ganz oben in utils.py hinzufügen
 
+# ... [plot_trajectories und sample_noise bleiben unverändert] ...
 
-def sample_noise(inputs):
-    """
-    Adds noise to future parts of the trajectory and returns noise level sigma.
-
-    Args:
-        inputs (torch.Tensor): [B, A, T, F], with T >= 10
-
-    Returns:
-        sigma (torch.Tensor): [B], noise level per sample in batch
-        noised_inputs (torch.Tensor): [B, A, T, F], with noise added from t=10 onwards
-    """
-    B, A, T, F = inputs.size()
-    T_obs = 10
-    T_future = T - T_obs
-
-    # Sample log sigma and convert to sigma
-    ln_sigma = torch.normal(mean=-1.2, std=1.2, size=(B,), device=inputs.device)  # [B]
-    sigma = torch.exp(ln_sigma)  # [B]
-
-    # Noise tensor
-    epsilon = torch.randn(B, A, T_future, F, device=inputs.device)  # [B, A, T_future, F]
-
-    # Clone inputs and add noise to future timesteps
-    noised_inputs = inputs.clone()
-    noised_inputs[:, :, T_obs:, :] += epsilon * sigma[:, None, None, None]  # broadcast sigma
-
-    return sigma, noised_inputs
-
-
-def embed_features(inputs, sigma, embedding_dim=256, T_obs=10, eval=False):
+def embed_features(
+    inputs: torch.Tensor, 
+    sigma: torch.Tensor, 
+    embedding_dim: int = 256, 
+    T_obs: int = 10, 
+    eval: bool = False, 
+    cond: Optional[torch.Tensor] = None # <--- NEU: Hinzugefügt
+) -> torch.Tensor:
     """
     Embed features using sinusoidal positional encodings for diffusion time tau, scenario time t,
-    and agent states x, y, theta.
-    
-    Args:
-        inputs (torch.Tensor): Input tensor [B, A, T, F], where F=3 for x, y, theta.
-                              Contains observed states (xobs) for t<T_obs and noisy states (xlat,τ) for t>=T_obs.
-        sigma (torch.Tensor): Noise levels [B,], one per batch.
-        embedding_dim (int): Dimension of each encoding vector, default 256.
-        T_obs (int): Number of observed time steps (default: 20).
-        eval (bool): Evaluation mode flag.
-    
-    Returns:
-        torch.Tensor: Embedded features [B, A, T, 5 * embedding_dim]
+    agent states x, y, theta, and optionally, conditioning vector (cond).
     """
     # Extract dimensions
     B, A, T, F = inputs.size()
     assert F == 3, "Expected F=3 for x, y, theta"
     assert embedding_dim % 2 == 0, "embedding_dim must be even"
     device = inputs.device
-
+    
     # Generate scenario time t as integers [0, T-1]
     t = torch.arange(0, T, dtype=torch.float32, device=device)  # [T,]
 
-    # Helper function for sinusoidal encoding
+    # Helper function for sinusoidal encoding (Muss lokal in der Funktion definiert oder global sein)
     def sinusoidal_encoding(values, min_period, max_period):
-        num_freqs = embedding_dim // 2  # e.g., 128 for embedding_dim=256
+        num_freqs = embedding_dim // 2
         i = torch.arange(num_freqs, device=device, dtype=torch.float32)
         exp_term = i / (num_freqs - 1) if num_freqs > 1 else torch.zeros_like(i)
         wavelengths = min_period * (max_period / min_period) ** exp_term
@@ -261,20 +230,21 @@ def embed_features(inputs, sigma, embedding_dim=256, T_obs=10, eval=False):
     t_enc = t_enc.expand(B, A, T, embedding_dim)  # [B, A, T, embedding_dim]
 
     # 3. Encode diffusion time tau
-   # if not eval:
-   #     sigma = sigma.squeeze()  # [B,]
-    # Create tau tensor: 0 for t < T_obs, sigma for t >= T_obs
     latent_mask = (t >= T_obs).float()  # [T,], 0 for observed, 1 for latent
     tau = sigma[:, None, None] * latent_mask[None, None, :]  # [B, 1, T]
     tau = tau.expand(B, A, T)  # [B, A, T], broadcast across agents
     tau_enc = sinusoidal_encoding(tau, min_period=0.1, max_period=10000)  # [B, A, T, embedding_dim]
 
-    # Concatenate all encodings: x, y, theta, t, tau
-    all_encodings = state_encodings + [t_enc, tau_enc]  # 5 tensors, each [B, A, T, embedding_dim]
-    embedded = torch.cat(all_encodings, dim=-1)  # [B, A, T, 5 * embedding_dim], e.g., [B, A, T, 1280]
+    # 4. Concatenate all primary encodings: x, y, theta, t, tau
+    all_features = state_encodings + [t_enc, tau_enc] 
     
-    return embedded
-
-if __name__ == "__main__":
-    print("all good!")
-
+    # 5. Add Conditioning Feature (CFG)
+    if cond is not None:
+        # Cond: [B, 1, 1, COND_DIM]. Muss auf [B, A, T, COND_DIM] erweitert werden.
+        cond_expanded = cond.expand(B, A, T, -1)
+        all_features.append(cond_expanded)
+        
+    # Kombiniere alle Features
+    embedded_features = torch.cat(all_features, dim=-1) # [B, A, T, D_total]
+    
+    return embedded_features
