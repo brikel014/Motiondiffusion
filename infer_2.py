@@ -377,7 +377,7 @@ def calculate_validation_loss_and_plot(
                         title_suffix=f"Condition: {cond_label_de} and Ego ID {ego0}"
                     )
                                         
-                    # Versuch zu speichern (wie in Ihrem Code)
+                    # Versuch zu speichern (wie in Ihrem Code) HIER SVG STATT PNG
                     try:
                         out_png = os.path.join(os.getcwd(), "MA.png")
                         fig_to_return.savefig(out_png, dpi=150, bbox_inches="tight"); print(f" Visualization saved: {out_png}")
@@ -452,8 +452,8 @@ if __name__ == "__main__":
         print("[SMOKE] Loss:", loss)
         if fig is not None:
             # Beispiel zum Speichern
-            fig.savefig("MA_test.png", dpi=350, bbox_inches="tight")
-            print("Visualization saved to MA_test.png")
+            fig.savefig("MA_test.svg", dpi=350, bbox_inches="tight")
+            print("Visualization saved to MA_test.svg")
 
     except Exception as e:
         print(f"[SMOKE] Failed: {e}")

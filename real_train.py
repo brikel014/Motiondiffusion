@@ -208,13 +208,22 @@ def train(model, writer):
                 cond_embed = cond_proj(y_cf)                             # [B,A,EMBED_DX]
                 cond_time  = cond_embed.unsqueeze(2).expand(-1,-1,Tp,-1) # [B,A,Tp,EMBED_DX]
                 embedded   = _add_condition_to_embed(embedded, cond_time, To)
+                # TRAIN: vor dem Forward
+                obs_mask   = feature_mask[:, :, :To]                    # [B,A,To]
+                pred_mask0 = torch.zeros_like(feature_mask[:, :, To:])  # [B,A,Tp]
+                full_mask_in = torch.cat([obs_mask, pred_mask0], dim=2) # [B,A,T]
 
+                # statt feature_mask:
+                model_out = model(embedded, roadgraph_tensor, full_mask_in, roadgraph_mask)[:, :, To:, :]
                 # Forward pass (unchanged)
-                model_out = model(embedded, roadgraph_tensor, feature_mask, roadgraph_mask)[:, :, To:, :]
+                #model_out = model(embedded, roadgraph_tensor, feature_mask, roadgraph_mask)[:, :, To:, :]
 
                 gt_pred   = feature_tensor[:, :, To:, :]
                 mask_pred = feature_mask[:, :, To:]
                 valid_mask = mask_pred.unsqueeze(-1).expand_as(gt_pred)
+
+
+
 
                 recon = model_out * c_out[:, None, None, None] + noised_tensor[:, :, To:, :] * c_skip[:, None, None, None]
 
@@ -270,11 +279,11 @@ def train(model, writer):
             avg_val_loss, val_fig = calculate_validation_loss_and_plot(
                 model=model,
                 val_xml_dir="/Users/brikelkeputa/Downloads/singapore_split/cleaneddata/test",
-                val_batch_size=32,
+                val_batch_size=1,
                 obs_len=10, pred_len=20,
                 max_radius=100,
                 num_polylines=500, num_points=10,
-                max_agents=32,
+                max_agents=1,
                 sigma_data=0.5,
                 device=device,
                 direction_command=True,             # see next point

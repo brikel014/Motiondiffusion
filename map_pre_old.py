@@ -406,7 +406,7 @@ class MapDataset(Dataset):
 ### Example Usage
 if __name__ == "__main__":
     dataset = MapDataset(
-        xml_dir='/Users/brikelkeputa/Downloads/singapore_split/cleaneddata/train', 
+        xml_dir='/Users/brikelkeputa/Downloads/Master-Thesis-main/carla_new->real_higher_dpi/predicted_xmls',
         obs_len=10,
         pred_len=20,
         max_radius=100,

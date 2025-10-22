@@ -1,0 +1,10 @@
+{
+  "count": 0,
+  "avg_sceneADE": 0.0,
+  "avg_sceneFDE": 0.0,
+  "avg_minSceneADE": 0.0,
+  "avg_minSceneFDE": 0.0,
+  "k_samples": 6,
+  "smoothed": true,
+  "ade_threshold": 5.0
+}

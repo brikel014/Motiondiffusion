@@ -16,12 +16,12 @@ SHAPELY_AVAILABLE = True
 OT_AVAILABLE = True
 
 # --- Configuration ---
-# <<< --- SET YOUR XML DIRECTORIES HERE --- >>>
-XML_DIRECTORY_1 = 'carla_new->real_with_plots_overfit_smoothed/predicted_xmls'  # Replace with the path to your first dataset folder
-original_xml_dir = './real_mixture/cleaneddata/train'
+# <<< --- SET YOUR XML DIRECTORIES HERE --- >>> 
+XML_DIRECTORY_1 = ''  # Replace with the path to your first dataset folder
+original_xml_dir = '/Users/brikelkeputa/Downloads/singapore_split/cleaneddata/test'
 
 # New directory with only 150 randomly sampled XMLs
-sampled_xml_dir = './real_mixture/cleaneddata/train_sampled_150'
+sampled_xml_dir = '/Users/brikelkeputa/Downloads/Master-Thesis-main/carla_new->real_higher_dpi/predicted_xmls'
 # Use this as your new XML_DIRECTORY_2
 XML_DIRECTORY_2 = sampled_xml_dir
 

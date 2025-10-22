@@ -134,7 +134,7 @@ def get_T(sigma_max, sigma_min, rho, N):
         T.append((sigma_max**(1/rho) + (i/(N-1)) * ((sigma_min**(1/rho)) - (sigma_max**(1/rho))))**rho)
     return torch.tensor(T, device=device)
 
-#T_schedule = get_T(SIGMA_MAX, SIGMA_MIN, RHO, N_DENOISING_STEPS)
+T_schedule = get_T(SIGMA_MAX, SIGMA_MIN, RHO, N_DENOISING_STEPS)
 
 # --- Denoising Function ---
 def denoise_single_trajectory(model, observed_past, feature_mask_real, roadgraph_tensor, roadgraph_mask, T):
@@ -640,7 +640,7 @@ def run_inference_and_save(model_path, xml_input_dir, output_dir, metrics_filena
     print("Loading model...")
     model = Denoiser().to(device)
     try:
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     except FileNotFoundError:
         print(f"Error: Model file not found at {model_path}")
         return
@@ -814,16 +814,16 @@ def run_inference_and_save(model_path, xml_input_dir, output_dir, metrics_filena
                     if APPLY_SMOOTHING:
                         plot_title += " (Smoothed)"
 
-                    #plot_scenario_and_save_png(
-                        #observed_past_plot_dict,
-                        #all_predicted_futures_plot_list_of_dicts,
-                        #best_pred_plot_dict,
-                        #roadgraph_polylines_global_list,
-                        #agent_ids_for_plot, 
-                        #str(current_ego_id), 
-                        #plot_filepath,
-                        #title=plot_title # Pass constructed title
-                        #)
+                    plot_scenario_and_save_png(
+                        observed_past_plot_dict,
+                        all_predicted_futures_plot_list_of_dicts,
+                        best_pred_plot_dict,
+                        roadgraph_polylines_global_list,
+                        agent_ids_for_plot, 
+                        str(current_ego_id), 
+                        plot_filepath,
+                        title=plot_title # Pass constructed title
+                        )
 
                 pred_k0_global = all_pred_futures_global_samples_tensor[0] # First sample (smoothed)
                 for i, agent_id_str in enumerate(real_agent_ids):
@@ -901,8 +901,8 @@ def run_inference_and_save(model_path, xml_input_dir, output_dir, metrics_filena
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    MODEL_FILE = "./saved_models_3/model_epoch_100_+440_REAL_CARLA_poly_10_pts_fixscale_newscenes.pt"
-    XML_INPUT_FOLDER = './real_mixture/cleaneddata/test'
+    MODEL_FILE = "/Users/brikelkeputa/Downloads/Master-Thesis-main/model_epoch_185_REAL_500_poly_10_pts.pt"
+    XML_INPUT_FOLDER = '/Users/brikelkeputa/Downloads/singapore_split/cleaneddata/test'
     OUTPUT_FOLDER = 'carla_new->real_higher_dpi' # New output folder name
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
